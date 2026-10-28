@@ -1,6 +1,6 @@
 # Devin demo: Churn investigation with an interactive report
 
-**What it shows:** Devin as a data analyst. It quantifies and segments a churn spike, tests competing hypotheses against release notes and support tickets, and delivers an interactive HTML report with the SQL behind every number.
+**What it shows:** Devin queries a SQLite warehouse to explain a churn spike, tests competing explanations against release notes and support tickets, and delivers an interactive HTML report with the SQL behind every number.
 
 **Needs:** GitHub only
 
