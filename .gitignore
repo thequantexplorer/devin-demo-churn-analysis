@@ -1,1 +1,3 @@
 __pycache__/
+reports/*.png
+analysis/report/kit.d.ts

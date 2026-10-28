@@ -1,0 +1,725 @@
+<div id="root"></div>
+<script type="text/jsx">
+const Q = data.queries;
+const S = data.significance;
+const rows = (id) => Q[id].rows;
+const usd = (v) => "$" + Math.round(v).toLocaleString("en-US");
+const usdK = (v) => "$" + (v / 1000).toFixed(1) + "K";
+const pct = (v, d = 1) => (v == null ? "n/a" : Number(v).toFixed(d) + "%");
+const RED = "rgb(var(--text-red))";
+const MUTED = "rgb(var(--text-tertiary))";
+
+// ---------- derived numbers (all from query outputs) ----------
+const monthly = rows("01_monthly_churn");
+const head = Object.fromEntries(rows("02_headline").map((r) => [r.period, r]));
+const aug = head["2026-08"], sep = head["2026-09"], oct = head["2026-10"], base = head["baseline_mar_aug"];
+const rev = Object.fromEntries(rows("13_revenue_impact").map((r) => [r.month, r]));
+const excessMrr = rev["2026-09"].excess_lost_mrr_usd + rev["2026-10"].excess_lost_mrr_usd;
+const excessCancels = rev["2026-09"].excess_cancellations + rev["2026-10"].excess_cancellations;
+const exposedMrr = rev["2026-09"].eu_card_mrr_still_active_usd;
+const totalMrr = rev["2026-09"].total_mrr_active_usd;
+const octEuRate = rev["2026-10"].cancellations / rev["2026-10"].active_start;
+const rxp = rows("05_region_x_payment");
+const cell = (region, pm, m) => rxp.find((r) => r.region === region && r.payment_method === pm && r.month === m);
+const nonEuCard = (m) => {
+  const rs = rxp.filter((r) => r.region !== "EU" && r.payment_method === "card" && r.month === m);
+  const a = rs.reduce((s, r) => s + r.active_start, 0), c = rs.reduce((s, r) => s + r.cancellations, 0);
+  return { active_start: a, cancellations: c, rate: (100 * c) / a };
+};
+const exSep = (() => {
+  const all = monthly.find((r) => r.month === "2026-09");
+  const eu = cell("EU", "card", "2026-09");
+  return (100 * (all.cancellations - eu.cancellations)) / (all.active_start - eu.active_start);
+})();
+const expectedSepAll = (sep.active_sub_months * base.logo_churn_pct) / 100;
+const excessSepAll = sep.cancellations - expectedSepAll;
+const euSepExcess = rev["2026-09"].excess_cancellations;
+const detail = rows("15_cancellation_detail");
+const euPfSepOct = detail.filter((r) => r.region === "EU" && r.payment_method === "card" && r.cancel_reason === "payment_failed" && r.canceled_at >= "2026-09-01");
+const euPfMrr = euPfSepOct.reduce((s, r) => s + r.mrr_usd, 0);
+const euCardSep = cell("EU", "card", "2026-09");
+const euCardSepPf = detail.filter((r) => r.region === "EU" && r.payment_method === "card" && r.cancel_reason === "payment_failed" && r.canceled_at.startsWith("2026-09")).length;
+const inv = rows("06_invoice_collection");
+const invCell = (region, pm, p) => inv.find((r) => r.region === region && r.payment_method === pm && r.period === p);
+const usage = Object.fromEntries(rows("12_usage_before_cancel").map((r) => [r.grp, r]));
+
+// ---------- small building blocks ----------
+function SqlRef({ ids }) {
+  return (
+    <CollapsibleRoot>
+      <CollapsibleTrigger caretPosition="left">
+        <Text size={12} className="text-secondary">SQL behind this section: {ids.map((id) => Q[id].file.split("/").pop()).join(", ")}</Text>
+      </CollapsibleTrigger>
+      <CollapsiblePanel>
+        <div className="flex flex-col gap-2 pt-2">
+          {ids.map((id) => <CodeBlock key={id} code={Q[id].sql} />)}
+        </div>
+      </CollapsiblePanel>
+    </CollapsibleRoot>
+  );
+}
+
+function Section({ title, lede, sql, children }) {
+  return (
+    <section className="flex flex-col gap-3">
+      <Text size={18} weight="semibold">{title}</Text>
+      {lede && <Text size={14} className="text-secondary">{lede}</Text>}
+      {children}
+      {sql && <SqlRef ids={sql} />}
+    </section>
+  );
+}
+
+function SimpleTable({ columns, data, wrap }) {
+  return (
+    <Table wrapText={wrap}>
+      <TableHeader>
+        <TableRow>{columns.map((c) => <TableHead key={c.key}>{c.label}</TableHead>)}</TableRow>
+      </TableHeader>
+      <TableBody>
+        {data.map((r, i) => (
+          <TableRow key={i}>
+            {columns.map((c) => <TableCell key={c.key}>{c.render ? c.render(r) : r[c.key]}</TableCell>)}
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+// ---------- 1. trend ----------
+function TrendChart() {
+  const [metric, setMetric] = useState("logo");
+  const eu = rows("05_region_x_payment");
+  const series = monthly.map((m) => {
+    const e = eu.filter((r) => r.region === "EU" && r.payment_method === "card" && r.month === m.month)[0];
+    const restActive = m.active_start - (e ? e.active_start : 0);
+    const restCanc = m.cancellations - (e ? e.cancellations : 0);
+    if (metric === "logo") {
+      return { month: m.month, all: m.logo_churn_pct, eucard: e ? e.logo_churn_pct : null, rest: +(100 * restCanc / restActive).toFixed(2) };
+    }
+    return { month: m.month, lost: m.lost_mrr_usd, eucardLost: e ? e.lost_mrr_usd : 0, restLost: m.lost_mrr_usd - (e ? e.lost_mrr_usd : 0) };
+  });
+  const cfg = metric === "logo"
+    ? { all: { label: "All accounts", color: chartColors[0] }, eucard: { label: "EU + card", color: RED }, rest: { label: "Everyone except EU + card", color: chartColors[2] } }
+    : { eucardLost: { label: "EU + card", color: RED }, restLost: { label: "Everyone else", color: chartColors[0] } };
+  return (
+    <div className="flex flex-col gap-3">
+      <SegmentedControl value={metric} onValueChange={setMetric} size="small">
+        <SegmentedControlItem value="logo">Logo churn rate</SegmentedControlItem>
+        <SegmentedControlItem value="mrr">Lost MRR</SegmentedControlItem>
+      </SegmentedControl>
+      <ChartContainer config={cfg} style={{ height: 280, width: "100%" }}>
+        {metric === "logo" ? (
+          <LineChart data={series}>
+            <ChartGrid />
+            <ChartXAxis dataKey="month" />
+            <ChartYAxis title="Monthly churn, % of subs active on the 1st" />
+            <ChartTooltip content={<ChartTooltipContent />} />
+            <ChartLegend content={<ChartLegendContent />} />
+            <ChartLine dataKey="all" stroke={chartColors[0]} strokeWidth={2} />
+            <ChartLine dataKey="eucard" stroke={RED} strokeWidth={2} />
+            <ChartLine dataKey="rest" stroke={chartColors[2]} strokeWidth={2} strokeDasharray="4 3" />
+          </LineChart>
+        ) : (
+          <BarChart data={series}>
+            <ChartGrid />
+            <ChartXAxis dataKey="month" />
+            <ChartYAxis title="Lost MRR (USD / month)" />
+            <ChartTooltip content={<ChartTooltipContent />} />
+            <ChartLegend content={<ChartLegendContent />} />
+            <ChartBar dataKey="restLost" stackId="a" radius={0} />
+            <ChartBar dataKey="eucardLost" stackId="a" />
+          </BarChart>
+        )}
+      </ChartContainer>
+      <SimpleTable
+        columns={[
+          { key: "month", label: "Month" },
+          { key: "active_start", label: "Active on 1st" },
+          { key: "cancellations", label: "Cancellations" },
+          { key: "logo_churn_pct", label: "Logo churn", render: (r) => pct(r.logo_churn_pct, 2) },
+          { key: "mrr_start_usd", label: "MRR on 1st", render: (r) => usd(r.mrr_start_usd) },
+          { key: "lost_mrr_usd", label: "Lost MRR", render: (r) => usd(r.lost_mrr_usd) },
+          { key: "mrr_churn_pct", label: "MRR churn", render: (r) => pct(r.mrr_churn_pct, 2) },
+          { key: "new_subscriptions", label: "New subs" },
+        ]}
+        data={monthly}
+      />
+    </div>
+  );
+}
+
+// ---------- 2. segment explorer ----------
+const DIMENSIONS = [
+  { value: "region", label: "Region" },
+  { value: "plan", label: "Plan" },
+  { value: "channel", label: "Acquisition channel" },
+  { value: "payment_method", label: "Payment method" },
+  { value: "region_x_payment", label: "Region x payment method" },
+];
+function segmentRows(dim) {
+  const src = dim === "region_x_payment"
+    ? rows("05_region_x_payment").map((r) => ({ ...r, segment: r.region + " + " + r.payment_method }))
+    : rows("03_segment_churn").filter((r) => r.dimension === dim);
+  const by = {};
+  src.forEach((r) => { (by[r.segment] = by[r.segment] || {})[r.month] = r; });
+  return Object.entries(by).map(([segment, m]) => {
+    const baseRows = ["2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08"].map((k) => m[k]).filter(Boolean);
+    const bA = baseRows.reduce((s, r) => s + r.active_start, 0), bC = baseRows.reduce((s, r) => s + r.cancellations, 0);
+    return {
+      segment,
+      baseline: +(100 * bC / bA).toFixed(2),
+      aug: m["2026-08"].logo_churn_pct, sep: m["2026-09"].logo_churn_pct, oct: m["2026-10"].logo_churn_pct,
+      sepActive: m["2026-09"].active_start, sepCanc: m["2026-09"].cancellations, sepLost: m["2026-09"].lost_mrr_usd,
+      excess: Math.round(m["2026-09"].cancellations - m["2026-09"].active_start * bC / bA),
+    };
+  });
+}
+function SegmentExplorer() {
+  const [dim, setDim] = useState("region");
+  const [sort, setSort] = useState({ key: "sep", dir: "desc" });
+  const data0 = useMemo(() => segmentRows(dim), [dim]);
+  const shown = [...data0].sort((a, b) => (sort.dir === "asc" ? 1 : -1) * (a[sort.key] > b[sort.key] ? 1 : a[sort.key] < b[sort.key] ? -1 : 0));
+  const onSort = (key) => setSort((s) => ({ key, dir: s.key === key && s.dir === "desc" ? "asc" : "desc" }));
+  const cfg = {
+    baseline: { label: "Mar-Aug baseline", color: chartColors[3] },
+    aug: { label: "Aug", color: chartColors[0] },
+    sep: { label: "Sep", color: RED },
+    oct: { label: "Oct", color: chartColors[1] },
+  };
+  const cols = [
+    ["segment", "Segment"], ["baseline", "Mar-Aug"], ["aug", "Aug"], ["sep", "Sep"], ["oct", "Oct"],
+    ["sepActive", "Active Sep 1"], ["sepCanc", "Sep cancels"], ["excess", "Sep excess vs baseline"], ["sepLost", "Sep lost MRR"],
+  ];
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-3">
+        <Text size={12} className="text-secondary">Segment by</Text>
+        <SimpleSelect options={DIMENSIONS} value={dim} onValueChange={setDim} />
+      </div>
+      <ChartContainer config={cfg} style={{ height: 260, width: "100%" }}>
+        <BarChart data={shown}>
+          <ChartGrid />
+          <ChartXAxis dataKey="segment" />
+          <ChartYAxis title="Monthly logo churn (%)" />
+          <ChartTooltip content={<ChartTooltipContent />} />
+          <ChartLegend content={<ChartLegendContent />} />
+          <ChartBar dataKey="baseline" fill={chartColors[3]} />
+          <ChartBar dataKey="aug" fill={chartColors[0]} />
+          <ChartBar dataKey="sep" fill={RED} />
+          <ChartBar dataKey="oct" fill={chartColors[1]} />
+        </BarChart>
+      </ChartContainer>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            {cols.map(([k, l]) => (
+              <SortableTableHead key={k} sort={sort.key === k ? sort.dir : undefined} onSort={() => onSort(k)} align={k === "segment" ? "start" : "end"}>{l}</SortableTableHead>
+            ))}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {shown.map((r) => (
+            <TableRow key={r.segment}>
+              <TableCell>{r.segment}</TableCell>
+              <TableCell className="text-right">{pct(r.baseline)}</TableCell>
+              <TableCell className="text-right">{pct(r.aug)}</TableCell>
+              <TableCell className={"text-right " + (r.sep > 2 * r.baseline ? "text-red" : "")}>{pct(r.sep)}</TableCell>
+              <TableCell className={"text-right " + (r.oct > 2 * r.baseline ? "text-red" : "")}>{pct(r.oct)}</TableCell>
+              <TableCell className="text-right">{r.sepActive}</TableCell>
+              <TableCell className="text-right">{r.sepCanc}</TableCell>
+              <TableCell className="text-right">{r.excess > 0 ? "+" + r.excess : r.excess}</TableCell>
+              <TableCell className="text-right">{usd(r.sepLost)}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+      <Text size={12} className="text-tertiary">Red: more than 2x the segment's own Mar-Aug rate. Excess = Sep cancellations minus (active on Sep 1 x baseline rate).</Text>
+    </div>
+  );
+}
+
+// ---------- 3. cancel reasons ----------
+const REASONS = ["payment_failed", "too_expensive", "switched_competitor", "missing_feature", "no_longer_needed"];
+function ReasonsChart() {
+  const [metric, setMetric] = useState("cancellations");
+  const by = {};
+  rows("04_cancel_reasons").forEach((r) => { (by[r.month] = by[r.month] || { month: r.month })[r.cancel_reason] = r[metric]; });
+  const series = Object.values(by).sort((a, b) => (a.month < b.month ? -1 : 1));
+  const cfg = Object.fromEntries(REASONS.map((r, i) => [r, { label: r, color: r === "payment_failed" ? RED : chartColors[i] }]));
+  return (
+    <div className="flex flex-col gap-3">
+      <SegmentedControl value={metric} onValueChange={setMetric} size="small">
+        <SegmentedControlItem value="cancellations">Cancellations</SegmentedControlItem>
+        <SegmentedControlItem value="lost_mrr_usd">Lost MRR (USD)</SegmentedControlItem>
+      </SegmentedControl>
+      <ChartContainer config={cfg} style={{ height: 260, width: "100%" }}>
+        <BarChart data={series}>
+          <ChartGrid />
+          <ChartXAxis dataKey="month" />
+          <ChartYAxis title={metric === "cancellations" ? "Cancellations" : "Lost MRR (USD)"} />
+          <ChartTooltip content={<ChartTooltipContent />} />
+          <ChartLegend content={<ChartLegendContent />} />
+          {REASONS.map((r, i) => <ChartBar key={r} dataKey={r} stackId="a" radius={i === REASONS.length - 1 ? undefined : 0} fill={cfg[r].color} />)}
+        </BarChart>
+      </ChartContainer>
+    </div>
+  );
+}
+
+// ---------- 4. mechanism: invoices + tickets ----------
+function InvoiceChart() {
+  const keys = ["EU card", "EU invoice", "NA card", "APAC card", "LATAM card"];
+  const by = {};
+  inv.forEach((r) => {
+    const k = r.region + " " + r.payment_method;
+    if (!keys.includes(k)) return;
+    (by[r.period] = by[r.period] || { period: r.period })[k] = r.uncollectible_pct;
+  });
+  const series = Object.values(by).sort((a, b) => (a.period < b.period ? -1 : 1));
+  const cfg = Object.fromEntries(keys.map((k, i) => [k, { label: k, color: k === "EU card" ? RED : chartColors[i] }]));
+  return (
+    <ChartContainer config={cfg} style={{ height: 260, width: "100%" }}>
+      <LineChart data={series}>
+        <ChartGrid />
+        <ChartXAxis dataKey="period" />
+        <ChartYAxis title="Invoices uncollectible (%)" />
+        <ChartTooltip content={<ChartTooltipContent />} />
+        <ChartLegend content={<ChartLegendContent />} />
+        {keys.map((k) => <ChartLine key={k} dataKey={k} stroke={cfg[k].color} strokeWidth={k === "EU card" ? 3 : 1.5} />)}
+      </LineChart>
+    </ChartContainer>
+  );
+}
+
+const TICKET_MONTHS = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"];
+function TicketTable() {
+  const [cat, setCat] = useState("all");
+  const t = rows("07_support_tickets");
+  const subjects = {};
+  t.forEach((r) => {
+    const s = (subjects[r.subject] = subjects[r.subject] || { subject: r.subject, category: r.category, eu: 0, total: 0, sentN: 0, sent: 0 });
+    s[r.month] = r.tickets;
+    if (r.month >= "2026-09") { s.eu += r.eu_tickets; s.total += r.tickets; }
+    s.sent += r.avg_sentiment * r.tickets; s.sentN += r.tickets;
+  });
+  const list = Object.values(subjects)
+    .filter((s) => cat === "all" || s.category === cat)
+    .map((s) => ({ ...s, jump: (s["2026-09"] || 0) - (s["2026-08"] || 0) }))
+    .sort((a, b) => b.jump - a.jump);
+  const cats = [{ value: "all", label: "All categories" }, { value: "billing", label: "Billing" }, { value: "pricing", label: "Pricing" }, { value: "product", label: "Product" }];
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-3">
+        <Text size={12} className="text-secondary">Category</Text>
+        <SimpleSelect options={cats} value={cat} onValueChange={setCat} />
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Subject</TableHead>
+            <TableHead>Category</TableHead>
+            {TICKET_MONTHS.map((m) => <TableHead key={m} className="text-right">{m.slice(5)}/26</TableHead>)}
+            <TableHead className="text-right">EU %, Sep-Oct</TableHead>
+            <TableHead className="text-right">Sentiment</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {list.map((s) => (
+            <TableRow key={s.subject}>
+              <TableCell>{s.subject}</TableCell>
+              <TableCell><Badge variant={s.category === "billing" ? "destructive" : s.category === "pricing" ? "warning" : "default"}>{s.category}</Badge></TableCell>
+              {TICKET_MONTHS.map((m) => <TableCell key={m} className={"text-right " + (m === "2026-09" && s.jump >= 8 ? "text-red" : "")}>{s[m] || 0}</TableCell>)}
+              <TableCell className="text-right">{s.total ? pct((100 * s.eu) / s.total, 0) : "n/a"}</TableCell>
+              <TableCell className="text-right">{(s.sent / s.sentN).toFixed(2)}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+      <Text size={12} className="text-tertiary">Sorted by Aug-to-Sep change. Red: up by 8 or more tickets. EU accounts are about 30% of the base.</Text>
+    </div>
+  );
+}
+
+// ---------- 5. timeline ----------
+function DailyTimeline() {
+  const d = Object.fromEntries(rows("08_daily_cancellations").map((r) => [r.day, r]));
+  const series = [];
+  for (let t = new Date("2026-07-01T00:00:00Z"); t <= new Date("2026-10-31T00:00:00Z"); t.setUTCDate(t.getUTCDate() + 1)) {
+    const k = t.toISOString().slice(0, 10);
+    series.push({ day: k, eu: d[k] ? d[k].eu_card_payment_failed : 0, other: d[k] ? d[k].all_other : 0 });
+  }
+  const cfg = { other: { label: "All other cancellations", color: chartColors[0] }, eu: { label: "EU + card, payment_failed", color: RED } };
+  const ref = (x, label) => (
+    <Recharts.ReferenceLine x={x} stroke={MUTED} strokeDasharray="4 3"
+      label={{ value: label, position: "insideTopLeft", fontSize: 11, fill: MUTED }} />
+  );
+  return (
+    <ChartContainer config={cfg} style={{ height: 280, width: "100%" }}>
+      <BarChart data={series}>
+        <ChartGrid />
+        <ChartXAxis dataKey="day" tickFormatter={(v) => v.slice(5)} minTickGap={24} />
+        <ChartYAxis title="Cancellations per day" />
+        <ChartTooltip content={<ChartTooltipContent />} />
+        <ChartLegend content={<ChartLegendContent />} />
+        <ChartBar dataKey="other" stackId="a" radius={0} />
+        <ChartBar dataKey="eu" stackId="a" fill={RED} />
+        {ref("2026-08-18", "4.7.0 EU PSP")}
+        {ref("2026-09-09", "4.8.0")}
+        {ref("2026-10-01", "Oct billing (no release)")}
+      </BarChart>
+    </ChartContainer>
+  );
+}
+
+function DunningChart() {
+  const by = {};
+  for (let i = 1; i <= 31; i++) by[i] = { day: String(i) };
+  rows("09_dunning_day_of_month").forEach((r) => { by[r.day_of_month][r.period] = r.payment_failed_cancellations; });
+  const cfg = { "Feb-Aug": { label: "Feb-Aug (7 months)", color: chartColors[0] }, "2026-09": { label: "Sep", color: RED }, "2026-10": { label: "Oct", color: chartColors[1] } };
+  return (
+    <ChartContainer config={cfg} style={{ height: 220, width: "100%" }}>
+      <BarChart data={Object.values(by)}>
+        <ChartGrid />
+        <ChartXAxis dataKey="day" />
+        <ChartYAxis title="payment_failed cancellations" />
+        <ChartTooltip content={<ChartTooltipContent />} />
+        <ChartLegend content={<ChartLegendContent />} />
+        <ChartBar dataKey="Feb-Aug" fill={chartColors[0]} />
+        <ChartBar dataKey="2026-09" fill={RED} />
+        <ChartBar dataKey="2026-10" fill={chartColors[1]} />
+      </BarChart>
+    </ChartContainer>
+  );
+}
+
+// ---------- 6. hypotheses ----------
+const teamRows = rows("11_team_price_change");
+const teamOld = teamRows.find((r) => r.view === "team_cohort" && r.segment.startsWith("$99"));
+const teamNew = teamRows.find((r) => r.view === "team_cohort" && r.segment.startsWith("$129"));
+const teByMonth = Object.fromEntries(teamRows.filter((r) => r.view === "too_expensive_by_month").map((r) => [r.segment, r.subscriptions]));
+const priceTk = Object.fromEntries(teamRows.filter((r) => r.view === "price_tickets_by_month").map((r) => [r.segment, r.subscriptions]));
+const reasons = rows("04_cancel_reasons");
+const reasonAt = (m, reason) => (reasons.find((r) => r.month === m && r.cancel_reason === reason) || { cancellations: 0 }).cancellations;
+const segTeam = rows("05_region_x_payment");
+const HYPOTHESES = [
+  {
+    h: "EU card payments broke after the PSP migration in 4.7.0 (2026-08-18, SCA / 3-D Secure flow)",
+    verdict: "Supported: root cause",
+    v: "destructive",
+    evidence: `EU + card churn went from ${pct(cell("EU", "card", "2026-08").logo_churn_pct)} in Aug to ${pct(euCardSep.logo_churn_pct)} in Sep (95% CI ${S.eu_card_sep_ci95_pct[0]}-${S.eu_card_sep_ci95_pct[1]}%). In the same region, invoice payers stayed at ${pct(cell("EU", "invoice", "2026-09").logo_churn_pct)}. EU card invoices that went uncollectible rose from ${pct(invCell("EU", "card", "2026-08").uncollectible_pct)} to ${pct(invCell("EU", "card", "2026-09").uncollectible_pct)}. ${euCardSepPf} of ${euCardSep.cancellations} EU card cancellations in Sep were payment_failed. Tickets about 3-D Secure and declined cards spiked, mostly from EU accounts. The pattern repeated with the October billing run.`,
+  },
+  {
+    h: "Team plan price change in 4.8.0 ($99 to $129) drove price-led churn",
+    verdict: "Rejected",
+    v: "success",
+    evidence: `The change applied to new signups only: existing invoices stayed the same. too_expensive cancellations were ${teByMonth["2026-08"]} in Aug, ${teByMonth["2026-09"]} in Sep and ${teByMonth["2026-10"]} in Oct. "Price went up?" tickets were ${priceTk["2026-08"]}, ${priceTk["2026-09"]} and ${priceTk["2026-10"]}. ${teamNew.canceled_sep_oct} of ${teamNew.subscriptions} new $129 subscribers canceled (${teamNew.too_expensive_sep_oct} as too_expensive). The jump in Team churn sits entirely in EU + card (see the plan x segment check below).`,
+  },
+  {
+    h: "A product regression in 4.8.0 (2026-09-09), which shipped on the day the spike began",
+    verdict: "Rejected",
+    v: "success",
+    evidence: `payment_failed cancellations fall on days 9-21 of every month, Feb through Aug too, so 09-09 is when the dunning window opens; the release date is a coincidence. The spike repeated from 10-09 with no release. Product ticket volume was flat and dark-mode sentiment was positive. Seat utilization among EU card churners was ${pct(usage["EU card, payment_failed"].seat_util_pct_last_8w)} in their last 8 weeks, against ${pct(usage["Retained accounts (Aug-Oct)"].seat_util_pct_last_8w)} for retained accounts. missing_feature and no_longer_needed were flat in Sep.`,
+  },
+  {
+    h: "Competitive losses or a market-wide shift",
+    verdict: "Rejected",
+    v: "success",
+    evidence: `switched_competitor cancellations were ${reasonAt("2026-08", "switched_competitor")} in Aug, ${reasonAt("2026-09", "switched_competitor")} in Sep and ${reasonAt("2026-10", "switched_competitor")} in Oct. Outside EU + card, Sep churn was ${pct(exSep, 2)} against a ${pct(base.logo_churn_pct, 2)} company baseline (p = ${S.non_eu_card_sep_vs_baseline.p_value} for non-EU card vs its own baseline).`,
+  },
+  {
+    h: "Acquisition mix or channel quality (for example a bad paid-search cohort)",
+    verdict: "Rejected",
+    v: "success",
+    evidence: "All four channels rose by a similar amount in Sep (13.6-15.5%), as expected when EU card payers are spread evenly across channels. Monthly new subscriptions were steady at 146-162. The pattern follows how customers pay, not how they were acquired.",
+  },
+  {
+    h: "September seasonality",
+    verdict: "Not testable, unlikely",
+    v: "warning",
+    evidence: "The snapshot covers only Jan-Oct 2026, so there is no prior September to compare against. Seasonality would not be confined to a single region and payment method, and the other 74% of subscriptions saw no change.",
+  },
+];
+
+function PlanCheck() {
+  const r = rows("16_plan_x_eu_card");
+  return ["business", "starter", "team"].map((plan) => {
+    const eu = r.find((x) => x.plan === plan && x.grp === "EU / card");
+    const other = r.find((x) => x.plan === plan && x.grp === "All other");
+    const active = eu.active_sep1 + other.active_sep1, canc = eu.sep_cancellations + other.sep_cancellations;
+    return { plan, active, canc, rate: (100 * canc) / active, eu: eu.sep_cancellations, euRate: eu.sep_churn_pct, restRate: other.sep_churn_pct };
+  });
+}
+
+// ---------- 7. account-level explorer ----------
+function uniq(k) { return [...new Set(detail.map((r) => r[k]))].sort(); }
+const FILTERS = [
+  ["region", "Region"], ["plan", "Plan"], ["channel", "Channel"], ["payment_method", "Payment"], ["cancel_reason", "Reason"],
+];
+function AccountExplorer() {
+  const [f, setF] = useState({ region: "all", plan: "all", channel: "all", payment_method: "all", cancel_reason: "all", month: "all" });
+  const [sort, setSort] = useState({ key: "canceled_at", dir: "asc" });
+  const [search, setSearch] = useState("");
+  const shown = detail
+    .filter((r) => FILTERS.every(([k]) => f[k] === "all" || r[k] === f[k]))
+    .filter((r) => f.month === "all" || r.canceled_at.startsWith(f.month))
+    .filter((r) => !search || String(r.account_id).includes(search.trim()))
+    .sort((a, b) => (sort.dir === "asc" ? 1 : -1) * (a[sort.key] > b[sort.key] ? 1 : a[sort.key] < b[sort.key] ? -1 : 0));
+  const onSort = (key) => setSort((s) => ({ key, dir: s.key === key && s.dir === "asc" ? "desc" : "asc" }));
+  const cols = [
+    ["account_id", "Account"], ["canceled_at", "Canceled"], ["region", "Region"], ["plan", "Plan"], ["channel", "Channel"],
+    ["payment_method", "Payment"], ["cancel_reason", "Reason"], ["mrr_usd", "MRR"], ["seats", "Seats"], ["last_invoice_status", "Last invoice"], ["last_invoice_attempts", "Attempts"],
+  ];
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-3">
+        {FILTERS.map(([k, label]) => (
+          <SimpleSelect key={k} value={f[k]} onValueChange={(v) => setF({ ...f, [k]: v })}
+            options={[{ value: "all", label: "All " + label.toLowerCase() }, ...uniq(k).map((v) => ({ value: v, label: v }))]} />
+        ))}
+        <SimpleSelect value={f.month} onValueChange={(v) => setF({ ...f, month: v })}
+          options={[{ value: "all", label: "Aug-Oct" }, { value: "2026-08", label: "Aug" }, { value: "2026-09", label: "Sep" }, { value: "2026-10", label: "Oct" }]} />
+        <Input placeholder="Account id" value={search} onValueChange={setSearch} className="w-[120px]" />
+        <Button variant="ghost" size="sm" onClick={() => { setF({ region: "all", plan: "all", channel: "all", payment_method: "all", cancel_reason: "all", month: "all" }); setSearch(""); }}>Reset</Button>
+      </div>
+      <Text size={13} className="text-secondary">{shown.length} cancellations, {usd(shown.reduce((s, r) => s + r.mrr_usd, 0))} MRR lost</Text>
+      <Table stickyHeader viewportClassName="max-h-96" scrollOrientation="both">
+        <TableHeader>
+          <TableRow>
+            {cols.map(([k, l]) => (
+              <SortableTableHead key={k} sort={sort.key === k ? sort.dir : undefined} onSort={() => onSort(k)} align={["mrr_usd", "seats", "last_invoice_attempts"].includes(k) ? "end" : "start"}>{l}</SortableTableHead>
+            ))}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {shown.map((r) => (
+            <TableRow key={r.account_id}>
+              <TableCell>{r.account_id}</TableCell>
+              <TableCell>{r.canceled_at}</TableCell>
+              <TableCell>{r.region}</TableCell>
+              <TableCell>{r.plan}</TableCell>
+              <TableCell>{r.channel}</TableCell>
+              <TableCell>{r.payment_method}</TableCell>
+              <TableCell className={r.cancel_reason === "payment_failed" ? "text-red" : ""}>{r.cancel_reason}</TableCell>
+              <TableCell className="text-right">{usd(r.mrr_usd)}</TableCell>
+              <TableCell className="text-right">{r.seats}</TableCell>
+              <TableCell>{r.last_invoice_status}</TableCell>
+              <TableCell className="text-right">{r.last_invoice_attempts}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
+  );
+}
+
+// ---------- page ----------
+function Report() {
+  const did = rows("10_did_groups");
+  const didPivot = ["EU / card", "EU / invoice", "non-EU / card", "non-EU / invoice"].map((g) => {
+    const pre = did.find((r) => r.grp === g && r.window === "pre_jun_aug");
+    const post = did.find((r) => r.grp === g && r.window === "post_sep_oct");
+    return { grp: g, pre: pre.logo_churn_pct, preN: pre.active_sub_months, post: post.logo_churn_pct, postN: post.active_sub_months, delta: +(post.logo_churn_pct - pre.logo_churn_pct).toFixed(2) };
+  });
+  const planCheck = PlanCheck();
+  return (
+    <PageLayout
+      title="September 2026 churn spike: root cause"
+      subtitle="Acme Cloud billing and product warehouse snapshot, Jan-Oct 2026. Prepared for the CFO ahead of the board meeting."
+      themeToggle
+    >
+      {/* Executive summary */}
+      <section className="flex flex-col gap-3">
+        <Text size={18} weight="semibold">Executive summary</Text>
+        <StatsRow columns={4}>
+          <StatCard label="Sep logo churn">
+            <StatCardValueRow>
+              <StatCardValue>{pct(sep.logo_churn_pct)}</StatCardValue>
+              <StatCardTrend direction="up" sentiment="negative">{(sep.logo_churn_pct / aug.logo_churn_pct).toFixed(1)}x Aug</StatCardTrend>
+            </StatCardValueRow>
+            <StatCardCaption>Aug {pct(aug.logo_churn_pct)}, Mar-Aug baseline {pct(base.logo_churn_pct)}, Oct {pct(oct.logo_churn_pct)}</StatCardCaption>
+          </StatCard>
+          <StatCard label="Excess cancellations, Sep-Oct">
+            <StatCardValue>{excessCancels}</StatCardValue>
+            <StatCardCaption>All from EU accounts paying by card</StatCardCaption>
+          </StatCard>
+          <StatCard label="Excess MRR lost, Sep-Oct">
+            <StatCardValue>{usdK(excessMrr)}</StatCardValue>
+            <StatCardCaption>About {usdK(excessMrr * 12)} ARR, {pct((100 * excessMrr) / totalMrr)} of current MRR</StatCardCaption>
+          </StatCard>
+          <StatCard label="MRR still exposed">
+            <StatCardValue>{usdK(exposedMrr)}</StatCardValue>
+            <StatCardCaption>{rev["2026-09"].eu_card_subs_still_active} EU card subs; about {usdK(exposedMrr * octEuRate)} more lost in Nov if unfixed</StatCardCaption>
+          </StatCard>
+        </StatsRow>
+        <BannerCard variant="error" title="Root cause: EU card renewals have been failing since the 4.7.0 payment-provider (PSP) migration. Customers did not choose to leave.">
+          Release 4.7.0 (2026-08-18) moved EU card payments to a new PSP with a new SCA / 3-D Secure flow. Starting with the first billing run on the new PSP (September), {pct(invCell("EU", "card", "2026-09").uncollectible_pct)} of EU card invoices went uncollectible, against about 1-3% before. Dunning then canceled those accounts on days 9-21 of the month. EU + card churn rose from {pct(cell("EU", "card", "2026-08").logo_churn_pct)} to {pct(euCardSep.logo_churn_pct)}, while every other segment stayed at its normal rate ({pct(exSep)} in Sep outside EU + card). The pattern repeated in October ({pct(cell("EU", "card", "2026-10").logo_churn_pct)}), so the problem is still live.
+        </BannerCard>
+        <Card>
+          <CardContent>
+            <CardBody className="flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <Text size={14} weight="semibold">Confidence: high</Text>
+                <Badge variant="success">about 90%</Badge>
+              </div>
+              <Text size={13} className="text-secondary">
+                Only the group exposed to the change (EU + card) moved. The two closest controls, EU invoice payers and non-EU card payers, stayed flat (difference-in-differences +{S.did_eu_card_vs_non_eu_card_pp} pp, p &lt; 0.001). The mechanism is visible at each step: invoices failed, then payment_failed cancellations followed, then 3-D Secure tickets came in. The spike repeated in October with no new release, and every competing explanation fails a direct test. The exact failure mode (for example, the 3-D Secure challenge not rendering) is medium confidence because it comes from ticket subjects; the warehouse has no PSP decline codes.
+              </Text>
+            </CardBody>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent>
+            <CardBody className="flex flex-col gap-2">
+              <Text size={14} weight="semibold">Recommendations</Text>
+              <ol className="list-decimal pl-5 flex flex-col gap-2">
+                <li><Text size={13}><b>Stop the losses before the Nov 1 billing run.</b> Send EU card renewals back through the legacy PSP, or ship a verified fix to the new 3-D Secure flow. Pause automatic cancellation and suspension after EU card payment failures until the fix is confirmed. Target: EU card uncollectible rate below 3%, against {pct(invCell("EU", "card", "2026-10").uncollectible_pct)} in Oct. This protects {usdK(exposedMrr)} of MRR.</Text></li>
+                <li><Text size={13}><b>Win back the {euPfSepOct.length} EU accounts canceled by failed card payments ({usdK(euPfMrr)} MRR).</b> They were still active users ({pct(usage["EU card, payment_failed"].seat_util_pct_last_8w)} seat utilization, same as retained accounts), so this churn can be recovered. Offer one-click reinstatement with no lost data, and SEPA Direct Debit or invoicing as a fallback payment method. Have customer success call the business and team accounts first.</Text></li>
+                <li><Text size={13}><b>Add guardrails to payment changes and to the churn metric.</b> Roll out payment-provider changes gradually with a holdout group. Alert when the payment failure rate for any region x payment method x PSP rises above 2x its baseline. Report voluntary and involuntary churn separately to the board, so a billing failure is not read as customer intent.</Text></li>
+              </ol>
+            </CardBody>
+          </CardContent>
+        </Card>
+      </section>
+
+      <Section title="1. Size of the spike" lede={`Logo churn was ${pct(sep.logo_churn_pct, 2)} in Sep against ${pct(aug.logo_churn_pct, 2)} in Aug (${(sep.logo_churn_pct / aug.logo_churn_pct).toFixed(1)}x). MRR churn was ${pct(sep.mrr_churn_pct, 2)} against ${pct(aug.mrr_churn_pct, 2)}. At the baseline rate Sep would have had about ${Math.round(expectedSepAll)} cancellations; there were ${sep.cancellations}, an excess of ${Math.round(excessSepAll)}, of which ${euSepExcess} came from EU + card. Without EU + card the company line is flat.`} sql={["01_monthly_churn", "02_headline", "05_region_x_payment"]}>
+        <TrendChart />
+      </Section>
+
+      <Section title="2. Segment explorer" lede="Pick a dimension. Region and payment method each show the spike, and crossing them puts nearly all of it in one cell: EU + card. Plan and channel rise across the board because EU card payers are spread across all plans and channels." sql={["03_segment_churn", "05_region_x_payment", "16_plan_x_eu_card"]}>
+        <SegmentExplorer />
+        <Text size={13} weight="medium">Plan check: is the Team spike a pricing effect?</Text>
+        <SimpleTable
+          columns={[
+            { key: "plan", label: "Plan" },
+            { key: "active", label: "Active Sep 1" },
+            { key: "canc", label: "Sep cancels" },
+            { key: "rate", label: "Sep churn", render: (r) => pct(r.rate) },
+            { key: "eu", label: "Of which EU + card" },
+            { key: "euRate", label: "EU + card churn", render: (r) => <span className="text-red">{pct(r.euRate)}</span> },
+            { key: "restRate", label: "Churn excl. EU + card", render: (r) => pct(r.restRate) },
+          ]}
+          data={planCheck}
+        />
+      </Section>
+
+      <Section title="3. Cancel reasons" lede={`payment_failed went from ${reasonAt("2026-08", "payment_failed")} in Aug to ${reasonAt("2026-09", "payment_failed")} in Sep and ${reasonAt("2026-10", "payment_failed")} in Oct. The voluntary reasons barely moved. This is involuntary churn. One exception: missing_feature rose to ${reasonAt("2026-10", "missing_feature")} in Oct, a separate, smaller signal to watch (SSO requests are also rising).`} sql={["04_cancel_reasons"]}>
+        <ReasonsChart />
+      </Section>
+
+      <Section title="4. Mechanism: invoice failures and support tickets" lede={`EU card invoices went uncollectible at ${pct(invCell("EU", "card", "2026-09").uncollectible_pct)} in Sep and ${pct(invCell("EU", "card", "2026-10").uncollectible_pct)} in Oct (avg ${invCell("EU", "card", "2026-09").avg_attempts} payment attempts per invoice, against ${invCell("EU", "card", "2026-08").avg_attempts} in Aug). Every other region and method stayed at 0-6%. Billing tickets jumped at the same time, led by "3-D Secure popup never appears" and "Card declined but my card works".`} sql={["06_invoice_collection", "07_support_tickets", "14_ticket_churn_link"]}>
+        <InvoiceChart />
+        <TicketTable />
+        <Text size={13} weight="medium">Billing tickets as a leading indicator (subs active on Sep 1)</Text>
+        <SimpleTable
+          columns={[
+            { key: "grp", label: "Group" }, { key: "ticket_status", label: "Ticket status" },
+            { key: "subs_active_sep1", label: "Subs" }, { key: "canceled_sep_oct", label: "Canceled Sep-Oct" },
+            { key: "canceled_pct", label: "Canceled", render: (r) => pct(r.canceled_pct) },
+          ]}
+          data={rows("14_ticket_churn_link")}
+        />
+        <Text size={12} className="text-tertiary">A billing ticket goes with a high cancel rate in every group. This shows where failed payments surface first; it does not show that tickets cause churn.</Text>
+      </Section>
+
+      <Section title="5. Timing: releases, billing runs and dunning" lede="EU card failures begin on 09-09, the same day 4.8.0 shipped. The dunning chart explains the overlap: payment_failed cancellations have always landed on days 9-21 of the month, so 09-09 is when the dunning window opened. October shows the same shape with no release. Release 4.7.0 (08-18) came after the August billing run, which is why September was the first month hit." sql={["08_daily_cancellations", "09_dunning_day_of_month"]}>
+        <DailyTimeline />
+        <Text size={13} weight="medium">Day of month of payment_failed cancellations</Text>
+        <DunningChart />
+      </Section>
+
+      <Section title="6. Competing hypotheses" lede="Each explanation was tested against the release notes, support tickets, invoices and usage data." sql={["11_team_price_change", "12_usage_before_cancel", "04_cancel_reasons"]}>
+        <Table wrapText>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[28%]">Hypothesis</TableHead>
+              <TableHead className="w-[14%]">Verdict</TableHead>
+              <TableHead>Evidence</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {HYPOTHESES.map((h) => (
+              <TableRow key={h.h}>
+                <TableCell><Text size={13} weight="medium">{h.h}</Text></TableCell>
+                <TableCell><Badge variant={h.v}>{h.verdict}</Badge></TableCell>
+                <TableCell><Text size={13} className="text-secondary">{h.evidence}</Text></TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+        <Text size={13} weight="medium">Engagement before cancellation (25% usage sample)</Text>
+        <SimpleTable
+          columns={[
+            { key: "grp", label: "Group" }, { key: "sampled_accounts", label: "Sampled accounts" },
+            { key: "seat_util_pct_prior_8w", label: "Seat utilization, 8 weeks before that", render: (r) => pct(r.seat_util_pct_prior_8w) },
+            { key: "seat_util_pct_last_8w", label: "Seat utilization, last 8 weeks", render: (r) => pct(r.seat_util_pct_last_8w) },
+          ]}
+          data={rows("12_usage_before_cancel")}
+        />
+      </Section>
+
+      <Section title="7. Correlation vs causation" lede="This is observational data, so the case for causation rests on the points below." sql={["10_did_groups"]}>
+        <SimpleTable
+          columns={[
+            { key: "grp", label: "Group" },
+            { key: "pre", label: "Jun-Aug churn", render: (r) => pct(r.pre, 2) },
+            { key: "post", label: "Sep-Oct churn", render: (r) => pct(r.post, 2) },
+            { key: "delta", label: "Change (pp)", render: (r) => <span className={r.delta > 5 ? "text-red" : ""}>{r.delta > 0 ? "+" : ""}{r.delta}</span> },
+            { key: "postN", label: "Sub-months (post)" },
+          ]}
+          data={didPivot}
+        />
+        <ul className="list-disc pl-5 flex flex-col gap-1">
+          <li><Text size={13}><b>Natural experiment:</b> 4.7.0 changed payments only for EU + card. That group moved by +{didPivot[0].delta} pp. EU invoice payers (same region, same product, same prices) and non-EU card payers (same payment method, old PSP) did not. Difference-in-differences: +{S.did_eu_card_vs_non_eu_card_pp} pp. EU card in Sep vs its own baseline: z = {S.eu_card_sep_vs_baseline.z}, p = {S.eu_card_sep_vs_baseline.p_value}. EU card vs EU invoice in Sep: p = {S.eu_card_vs_eu_invoice_sep.p_value}.</Text></li>
+          <li><Text size={13}><b>Mechanism:</b> each Sep-Oct payment_failed cancellation has an uncollectible invoice in the same month, and those invoices needed 3-4 payment attempts.</Text></li>
+          <li><Text size={13}><b>Timing:</b> release (08-18), then the first billing run on the new PSP (Sep), then dunning cancellations (09-09 to 09-21). The same sequence repeated in Oct with no release.</Text></li>
+          <li><Text size={13}><b>Engaged churners:</b> the accounts lost were using the product as much as retained ones. That fits a payment failure, not dissatisfaction.</Text></li>
+          <li><Text size={13}><b>Limits:</b> the warehouse has no PSP authorization or decline codes, so the exact failure (3-D Secure challenge vs decline) comes from ticket text. Payment method is stored per account, not per attempt. Usage covers a 25% sample. There is no prior-year September to rule out seasonality directly.</Text></li>
+        </ul>
+      </Section>
+
+      <Section title="8. Revenue impact" lede={`Counterfactual: EU + card churning at its own Mar-Aug MRR churn rate (${pct(rev["2026-09"].baseline_mrr_churn_pct, 2)} per month). The excess is ${usd(excessMrr)} of MRR over Sep-Oct, about ${usd(excessMrr * 12)} annualized. Another ${usd(exposedMrr)} of MRR sits with EU card subscribers who have not churned yet. At Oct's ${pct(100 * octEuRate)} monthly rate, about ${usd(exposedMrr * octEuRate)} more would go in Nov.`} sql={["13_revenue_impact"]}>
+        <SimpleTable
+          columns={[
+            { key: "month", label: "Month" },
+            { key: "active_start", label: "Subs on 1st" },
+            { key: "cancellations", label: "Cancels" },
+            { key: "expected_cancellations", label: "Expected" },
+            { key: "excess_cancellations", label: "Excess" },
+            { key: "lost_mrr_usd", label: "Lost MRR", render: (r) => usd(r.lost_mrr_usd) },
+            { key: "expected_lost_mrr_usd", label: "Expected lost", render: (r) => usd(r.expected_lost_mrr_usd) },
+            { key: "excess_lost_mrr_usd", label: "Excess lost", render: (r) => <span className="text-red">{usd(r.excess_lost_mrr_usd)}</span> },
+          ]}
+          data={rows("13_revenue_impact")}
+        />
+      </Section>
+
+      <Section title="9. Account-level cancellations, Aug-Oct" lede="Filter to any segment to check the numbers above or build a win-back list. Sort by any column." sql={["15_cancellation_detail"]}>
+        <AccountExplorer />
+      </Section>
+
+      <Section title="Appendix: every query" lede="Generated by analysis/run_queries.py against data/metrics.db; each number in this report comes from one of these.">
+        <div className="flex flex-col gap-1">
+          {Object.entries(Q).map(([id, q]) => (
+            <CollapsibleRoot key={id}>
+              <CollapsibleTrigger caretPosition="left"><Text size={13}><span className="font-mono">{q.file.split("/").pop()}</span>: {q.title}</Text></CollapsibleTrigger>
+              <CollapsiblePanel>
+                <div className="flex flex-col gap-2 py-2">
+                  <Text size={12} className="text-secondary">{q.description}</Text>
+                  <CodeBlock code={q.sql} />
+                </div>
+              </CollapsiblePanel>
+            </CollapsibleRoot>
+          ))}
+        </div>
+      </Section>
+
+      <Footnote>
+        Source: data/metrics.db (Acme Cloud warehouse snapshot, Jan-Oct 2026). Churn = subscriptions canceled in month / subscriptions active on the 1st. Baseline = pooled Mar-Aug. Statistics: {S.method}
+      </Footnote>
+    </PageLayout>
+  );
+}
+render(<Report />);
+</script>
